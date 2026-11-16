@@ -28,6 +28,9 @@ import requests
 # Datasets shared between the producer DAG and the consumer DAG in this file
 current_astronauts_dataset = Dataset("current_astronauts")
 iss_location_dataset = Dataset("iss_location")
+# A third dataset example: updates to this Dataset carry extra metadata
+# (a per-craft headcount) that downstream DAGs can read.
+astronaut_craft_summary_dataset = Dataset("astronaut_craft_summary")
 
 
 # Define the basic parameters of the DAG, like schedule and start_date
@@ -99,11 +102,38 @@ def example_astronauts():
         )
         return location
 
+    @task(
+        # A third dataset example: this task updates the
+        # `astronaut_craft_summary` Dataset and attaches extra metadata to it
+        outlets=[astronaut_craft_summary_dataset]
+    )
+    def summarize_crafts(people_in_space: list[dict], **context) -> dict:
+        """
+        This task counts how many astronauts are aboard each craft. Through
+        `outlet_events`, it attaches the counts as `extra` metadata on the
+        Dataset event, so downstream DAGs can read the summary straight from
+        the event without pulling XComs from this DAG.
+        """
+        craft_counts: dict[str, int] = {}
+        for person in people_in_space:
+            craft_counts[person["craft"]] = craft_counts.get(person["craft"], 0) + 1
+
+        context["outlet_events"][astronaut_craft_summary_dataset].extra = {
+            "craft_counts": craft_counts,
+            "total_people": len(people_in_space),
+        }
+        print(f"Astronauts per craft: {craft_counts}")
+        return craft_counts
+
+    astronauts = get_astronauts()
+
     # Use dynamic task mapping to run the print_astronaut_craft task for each
     # Astronaut in space
     print_astronaut_craft.partial(greeting="Hello! :)").expand(
-        person_in_space=get_astronauts()  # Define dependencies using TaskFlow API syntax
+        person_in_space=astronauts  # Define dependencies using TaskFlow API syntax
     )
+
+    summarize_crafts(astronauts)
 
     get_iss_location()
 
@@ -142,3 +172,34 @@ def example_iss_dataset_consumer():
 
 
 example_iss_dataset_consumer()
+
+
+@dag(
+    start_date=datetime(2024, 1, 1),
+    # Runs every time the `astronaut_craft_summary` Dataset is updated
+    schedule=[astronaut_craft_summary_dataset],
+    catchup=False,
+    default_args={"owner": "Astro", "retries": 3},
+    tags=["example"],
+)
+def example_craft_summary_consumer():
+    @task
+    def report_craft_summary(**context) -> None:
+        """
+        This task reads the `extra` metadata attached to the Dataset event
+        that triggered this run and prints the per-craft headcount.
+        """
+        triggering_events = context["triggering_dataset_events"]
+        for event in triggering_events[astronaut_craft_summary_dataset.uri]:
+            extra = event.extra or {}
+            print(
+                f"{extra.get('total_people', 'Unknown')} people in space "
+                f"(reported by {event.source_dag_id} at {event.timestamp}):"
+            )
+            for craft, count in extra.get("craft_counts", {}).items():
+                print(f"  - {craft}: {count}")
+
+    report_craft_summary()
+
+
+example_craft_summary_consumer()
