@@ -125,6 +125,83 @@ def example_astronauts():
         print(f"Astronauts per craft: {craft_counts}")
         return craft_counts
 
+    @task
+    def aggregate_astronaut_data(people_in_space: list[dict]) -> dict:
+        """
+        This task processes the astronaut data and builds a set of summary
+        statistics: total count, spacecraft distribution, unique crafts, and
+        an analysis of astronaut names. It returns a dictionary with all of
+        the calculated statistics, which is pushed to XCom for downstream use.
+        """
+        total_count = len(people_in_space)
+
+        # Spacecraft distribution: headcount and share of total per craft
+        craft_counts: dict[str, int] = {}
+        for person in people_in_space:
+            craft = person.get("craft", "Unknown")
+            craft_counts[craft] = craft_counts.get(craft, 0) + 1
+
+        craft_distribution = {
+            craft: {
+                "count": count,
+                "percentage": round(count / total_count * 100, 2)
+                if total_count
+                else 0.0,
+            }
+            for craft, count in sorted(
+                craft_counts.items(), key=lambda item: item[1], reverse=True
+            )
+        }
+        unique_crafts = sorted(craft_counts)
+
+        # Name analysis
+        names = [person.get("name", "").strip() for person in people_in_space]
+        names = [name for name in names if name]
+        name_lengths = [len(name) for name in names]
+
+        first_initial_counts: dict[str, int] = {}
+        last_name_counts: dict[str, int] = {}
+        for name in names:
+            initial = name[0].upper()
+            first_initial_counts[initial] = first_initial_counts.get(initial, 0) + 1
+            last_name = name.split()[-1]
+            last_name_counts[last_name] = last_name_counts.get(last_name, 0) + 1
+
+        name_analysis = {
+            "total_names": len(names),
+            "unique_names": len(set(names)),
+            "average_name_length": round(sum(name_lengths) / len(names), 2)
+            if names
+            else 0.0,
+            "longest_name": max(names, key=len) if names else None,
+            "shortest_name": min(names, key=len) if names else None,
+            "names_sorted": sorted(names),
+            "first_initial_distribution": dict(sorted(first_initial_counts.items())),
+            "shared_last_names": {
+                last: count for last, count in last_name_counts.items() if count > 1
+            },
+        }
+
+        stats = {
+            "total_count": total_count,
+            "spacecraft_distribution": craft_distribution,
+            "unique_crafts": unique_crafts,
+            "unique_craft_count": len(unique_crafts),
+            "most_populated_craft": next(iter(craft_distribution), None),
+            "name_analysis": name_analysis,
+        }
+
+        print(f"Total astronauts in space: {total_count}")
+        print(f"Unique crafts ({len(unique_crafts)}): {', '.join(unique_crafts)}")
+        for craft, details in craft_distribution.items():
+            print(f"  - {craft}: {details['count']} ({details['percentage']}%)")
+        print(
+            f"Average name length: {name_analysis['average_name_length']}, "
+            f"longest: {name_analysis['longest_name']}, "
+            f"shortest: {name_analysis['shortest_name']}"
+        )
+        return stats
+
     astronauts = get_astronauts()
 
     # Use dynamic task mapping to run the print_astronaut_craft task for each
@@ -134,6 +211,8 @@ def example_astronauts():
     )
 
     summarize_crafts(astronauts)
+
+    aggregate_astronaut_data(astronauts)
 
     get_iss_location()
 
