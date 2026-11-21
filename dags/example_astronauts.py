@@ -23,6 +23,7 @@ first DAG tutorial: https://docs.astronomer.io/learn/get-started-with-airflow
 from airflow import Dataset
 from airflow.decorators import dag, task
 from pendulum import datetime
+import pendulum
 import requests
 import statistics
 
@@ -35,6 +36,25 @@ JSC_LONGITUDE = -95.0907
 SPACECRAFT_CAPACITY = {
     "ISS": 7,
     "Tiangong": 3,
+}
+
+# Data quality thresholds used by `validate_data_quality`
+# Maximum age of the ISS position and the weather observation for the data
+# to count as timely.
+ISS_MAX_AGE_MINUTES = 10
+WEATHER_MAX_AGE_MINUTES = 120
+# The ISS orbit is inclined ~51.6 degrees, so it never goes beyond this latitude.
+ISS_MAX_ABS_LATITUDE = 52.0
+# Plausible ranges for weather readings in Houston, TX: (min, max)
+WEATHER_RANGES = {
+    "temperature_c": (-20, 50),
+    "apparent_temperature_c": (-30, 60),
+    "relative_humidity_pct": (0, 100),
+    "precipitation_mm": (0, 200),
+    "cloud_cover_pct": (0, 100),
+    "surface_pressure_hpa": (870, 1085),
+    "wind_speed_kmh": (0, 300),
+    "wind_direction_deg": (0, 360),
 }
 
 # Datasets shared between the producer DAG and the consumer DAG in this file
@@ -349,6 +369,393 @@ def example_astronauts():
         print(f"Correlation snapshot: {analysis}")
         return analysis
 
+    @task
+    def generate_summary_report(
+        people_in_space: list[dict],
+        weather: dict,
+        correlation: dict,
+        astronaut_stats: dict,
+        **context,
+    ) -> dict:
+        """
+        This task generates a comprehensive summary report by consolidating
+        data from all major pipeline tasks: astronaut data, weather data,
+        correlation analysis, and calculated statistics. It provides an
+        executive summary with key findings, metrics, and actionable insights.
+        """
+        total_astronauts = astronaut_stats.get("total_astronauts", 0)
+        distribution = astronaut_stats.get("distribution", {})
+        capacity_metrics = astronaut_stats.get("capacity_metrics", {})
+        name_stats = astronaut_stats.get("name_length_stats", {})
+        crew_stats = astronaut_stats.get("crew_size_stats", {})
+        indicators = correlation.get("indicators", {})
+
+        # Key findings
+        key_findings = [
+            f"{total_astronauts} astronaut(s) are in space across "
+            f"{len(distribution)} spacecraft."
+        ]
+        if distribution:
+            busiest_craft, busiest = next(iter(distribution.items()))
+            key_findings.append(
+                f"{busiest_craft} carries the most crew: {busiest['count']} "
+                f"({busiest['share_pct']}% of all astronauts)."
+            )
+        if name_stats.get("count"):
+            key_findings.append(
+                f"Astronaut names average {name_stats['mean']} characters; "
+                f"longest is {name_stats.get('longest_name')}."
+            )
+        key_findings.append(
+            f"Houston (JSC) reports {weather.get('temperature_c')}°C, "
+            f"wind {weather.get('wind_speed_kmh')} km/h, cloud cover "
+            f"{weather.get('cloud_cover_pct')}%; calm and clear: "
+            f"{indicators.get('calm_and_clear_at_jsc')}."
+        )
+
+        # Actionable insights
+        insights = []
+        for craft, metrics in capacity_metrics.items():
+            if metrics.get("over_nominal_capacity"):
+                insights.append(
+                    f"{craft} is above nominal capacity "
+                    f"({metrics['crew']}/{metrics['nominal_capacity']}, "
+                    f"{metrics['utilization_pct']}%). Review crew rotation."
+                )
+            elif metrics.get("nominal_capacity") is None:
+                insights.append(
+                    f"{craft} has no nominal capacity defined. Add it to "
+                    f"SPACECRAFT_CAPACITY to track utilization."
+                )
+        if len(people_in_space) != total_astronauts:
+            insights.append(
+                f"Data mismatch: {len(people_in_space)} astronauts from the "
+                f"API vs {total_astronauts} in statistics. Check the pipeline."
+            )
+        missing_weather = [
+            key
+            for key in ("temperature_c", "wind_speed_kmh", "cloud_cover_pct")
+            if weather.get(key) is None
+        ]
+        if missing_weather:
+            insights.append(
+                f"Weather data is incomplete (missing: "
+                f"{', '.join(missing_weather)}). Check the Open-Meteo API."
+            )
+        if indicators.get("calm_and_clear_at_jsc"):
+            insights.append(
+                "Conditions at JSC are calm and clear, suitable for "
+                "outdoor operations and ground observations."
+            )
+        if not insights:
+            insights.append("No issues detected. All metrics are nominal.")
+
+        report = {
+            "report_date": context["ds"],
+            "run_id": context["run_id"],
+            "executive_summary": {
+                "total_astronauts": total_astronauts,
+                "spacecraft_count": len(distribution),
+                "weather_location": weather.get("location"),
+                "weather_observed_at": weather.get("observed_at"),
+                "calm_and_clear_at_jsc": indicators.get("calm_and_clear_at_jsc"),
+            },
+            "key_metrics": {
+                "crew_distribution": distribution,
+                "capacity_metrics": capacity_metrics,
+                "mean_crew_size": crew_stats.get("mean"),
+                "mean_name_length": name_stats.get("mean"),
+                "temperature_c": weather.get("temperature_c"),
+                "relative_humidity_pct": weather.get("relative_humidity_pct"),
+                "wind_speed_kmh": weather.get("wind_speed_kmh"),
+                "cloud_cover_pct": weather.get("cloud_cover_pct"),
+                "astronauts_per_degree_c": indicators.get("astronauts_per_degree_c"),
+            },
+            "key_findings": key_findings,
+            "actionable_insights": insights,
+        }
+
+        print("=" * 60)
+        print(f"ASTRONAUT PIPELINE SUMMARY REPORT - {report['report_date']}")
+        print("=" * 60)
+        print("Key findings:")
+        for finding in key_findings:
+            print(f"  - {finding}")
+        print("Actionable insights:")
+        for insight in insights:
+            print(f"  - {insight}")
+        print("=" * 60)
+        return report
+
+    @task
+    def validate_data_quality(
+        people_in_space: list[dict],
+        weather: dict,
+        iss_location: dict,
+        spacecraft_summary: dict,
+        astronaut_stats: dict,
+        correlation: dict,
+        **context,
+    ) -> dict:
+        """
+        This task performs comprehensive data quality validation across all
+        data sources in the pipeline (astronauts, ISS location, weather, and
+        the derived summary, statistics and correlation). It checks for
+        completeness, accuracy, consistency, and timeliness of the data, and
+        returns a detailed validation report with a pass/fail status for each
+        check. The report is logged and pushed to XCom; failed checks do not
+        fail the task.
+        """
+        checks: list[dict] = []
+
+        def add_check(
+            dimension: str, source: str, name: str, passed: bool, details: str
+        ) -> None:
+            checks.append(
+                {
+                    "dimension": dimension,
+                    "source": source,
+                    "check": name,
+                    "status": "PASS" if passed else "FAIL",
+                    "details": details,
+                }
+            )
+
+        def in_range(value, low, high) -> bool:
+            return isinstance(value, (int, float)) and low <= value <= high
+
+        now = pendulum.now("UTC")
+        total = len(people_in_space)
+
+        # ---------------- Completeness ----------------
+        add_check(
+            "completeness",
+            "astronauts",
+            "astronaut_list_not_empty",
+            total > 0,
+            f"{total} astronaut record(s) received.",
+        )
+        incomplete_people = [
+            i
+            for i, p in enumerate(people_in_space)
+            if not str(p.get("name") or "").strip()
+            or not str(p.get("craft") or "").strip()
+        ]
+        add_check(
+            "completeness",
+            "astronauts",
+            "astronaut_required_fields",
+            not incomplete_people,
+            "All records have a name and craft."
+            if not incomplete_people
+            else f"Records missing name or craft at index: {incomplete_people}",
+        )
+        missing_weather = [
+            key
+            for key in ["observed_at", *WEATHER_RANGES, "weather_code"]
+            if weather.get(key) is None
+        ]
+        add_check(
+            "completeness",
+            "weather",
+            "weather_required_fields",
+            not missing_weather,
+            "All weather fields present."
+            if not missing_weather
+            else f"Missing weather fields: {missing_weather}",
+        )
+        missing_iss = [
+            key
+            for key in ("latitude", "longitude", "timestamp")
+            if iss_location.get(key) is None
+        ]
+        add_check(
+            "completeness",
+            "iss_location",
+            "iss_required_fields",
+            not missing_iss,
+            "All ISS location fields present."
+            if not missing_iss
+            else f"Missing ISS location fields: {missing_iss}",
+        )
+
+        # ---------------- Accuracy ----------------
+        lat, lon = iss_location.get("latitude"), iss_location.get("longitude")
+        add_check(
+            "accuracy",
+            "iss_location",
+            "iss_coordinates_valid",
+            in_range(lat, -90, 90) and in_range(lon, -180, 180),
+            f"latitude={lat}, longitude={lon}",
+        )
+        add_check(
+            "accuracy",
+            "iss_location",
+            "iss_latitude_within_orbit_inclination",
+            in_range(lat, -ISS_MAX_ABS_LATITUDE, ISS_MAX_ABS_LATITUDE),
+            f"|latitude| must be <= {ISS_MAX_ABS_LATITUDE}; got {lat}",
+        )
+        out_of_range = {
+            key: weather.get(key)
+            for key, (low, high) in WEATHER_RANGES.items()
+            if weather.get(key) is not None
+            and not in_range(weather.get(key), low, high)
+        }
+        add_check(
+            "accuracy",
+            "weather",
+            "weather_values_in_plausible_range",
+            not out_of_range,
+            "All weather values within plausible ranges."
+            if not out_of_range
+            else f"Out-of-range values: {out_of_range}",
+        )
+        unknown_crafts = sorted(
+            {p.get("craft") for p in people_in_space} - set(SPACECRAFT_CAPACITY)
+        )
+        add_check(
+            "accuracy",
+            "astronauts",
+            "crafts_are_known",
+            not unknown_crafts,
+            "All crafts are in SPACECRAFT_CAPACITY."
+            if not unknown_crafts
+            else f"Unknown crafts: {unknown_crafts}",
+        )
+
+        # ---------------- Consistency ----------------
+        reported_number = context["ti"].xcom_pull(
+            task_ids="get_astronauts", key="number_of_people_in_space"
+        )
+        add_check(
+            "consistency",
+            "astronauts",
+            "api_count_matches_records",
+            reported_number == total,
+            f"API reported {reported_number}, received {total} record(s).",
+        )
+        names = [str(p.get("name") or "").strip() for p in people_in_space]
+        duplicates = sorted({n for n in names if n and names.count(n) > 1})
+        add_check(
+            "consistency",
+            "astronauts",
+            "no_duplicate_astronauts",
+            not duplicates,
+            "No duplicate names."
+            if not duplicates
+            else f"Duplicate names: {duplicates}",
+        )
+        summary_counts = spacecraft_summary.get("spacecraft_counts", {})
+        add_check(
+            "consistency",
+            "spacecraft_summary",
+            "summary_total_matches_source",
+            spacecraft_summary.get("total_astronauts") == total
+            and sum(summary_counts.values()) == total,
+            f"summary total={spacecraft_summary.get('total_astronauts')}, "
+            f"sum of craft counts={sum(summary_counts.values())}, "
+            f"source={total}",
+        )
+        stats_counts = {
+            craft: d.get("count")
+            for craft, d in astronaut_stats.get("distribution", {}).items()
+        }
+        add_check(
+            "consistency",
+            "astronaut_stats",
+            "stats_match_summary",
+            astronaut_stats.get("total_astronauts") == total
+            and stats_counts == summary_counts,
+            f"stats total={astronaut_stats.get('total_astronauts')}, "
+            f"stats per craft={stats_counts}, summary per craft={summary_counts}",
+        )
+        corr_total = correlation.get("astronauts", {}).get("total_astronauts")
+        add_check(
+            "consistency",
+            "correlation",
+            "correlation_matches_sources",
+            corr_total == total
+            and correlation.get("observed_at") == weather.get("observed_at"),
+            f"correlation total={corr_total} (source {total}), "
+            f"observed_at={correlation.get('observed_at')} "
+            f"(weather {weather.get('observed_at')})",
+        )
+
+        # ---------------- Timeliness ----------------
+        iss_ts = iss_location.get("timestamp")
+        if isinstance(iss_ts, (int, float)):
+            iss_age = (now - pendulum.from_timestamp(iss_ts, tz="UTC")).in_minutes()
+            add_check(
+                "timeliness",
+                "iss_location",
+                "iss_position_is_fresh",
+                0 <= iss_age <= ISS_MAX_AGE_MINUTES,
+                f"Position is {iss_age} min old (max {ISS_MAX_AGE_MINUTES} min).",
+            )
+        else:
+            add_check(
+                "timeliness",
+                "iss_location",
+                "iss_position_is_fresh",
+                False,
+                f"Invalid ISS timestamp: {iss_ts}",
+            )
+        observed_at = weather.get("observed_at")
+        try:
+            # Open-Meteo returns local time without an offset
+            observed = pendulum.parse(observed_at, tz="America/Chicago")
+            weather_age = (now - observed).in_minutes()
+            add_check(
+                "timeliness",
+                "weather",
+                "weather_observation_is_fresh",
+                0 <= weather_age <= WEATHER_MAX_AGE_MINUTES,
+                f"Observation is {weather_age} min old "
+                f"(max {WEATHER_MAX_AGE_MINUTES} min).",
+            )
+        except Exception as err:  # noqa: BLE001 - report, don't crash
+            add_check(
+                "timeliness",
+                "weather",
+                "weather_observation_is_fresh",
+                False,
+                f"Could not parse observed_at={observed_at!r}: {err}",
+            )
+
+        # ---------------- Report ----------------
+        failed = [c for c in checks if c["status"] == "FAIL"]
+        by_dimension: dict[str, dict[str, int]] = {}
+        for c in checks:
+            dim = by_dimension.setdefault(c["dimension"], {"passed": 0, "failed": 0})
+            dim["passed" if c["status"] == "PASS" else "failed"] += 1
+
+        report = {
+            "validated_at": now.to_iso8601_string(),
+            "run_id": context["run_id"],
+            "overall_status": "PASS" if not failed else "FAIL",
+            "total_checks": len(checks),
+            "passed_checks": len(checks) - len(failed),
+            "failed_checks": len(failed),
+            "by_dimension": by_dimension,
+            "checks": checks,
+        }
+
+        print("=" * 60)
+        print(f"DATA QUALITY VALIDATION REPORT - {report['validated_at']}")
+        print("=" * 60)
+        for c in checks:
+            print(
+                f"[{c['status']}] {c['dimension']:<12} {c['source']:<18} "
+                f"{c['check']}: {c['details']}"
+            )
+        print("-" * 60)
+        print(
+            f"Overall: {report['overall_status']} "
+            f"({report['passed_checks']}/{report['total_checks']} checks passed)"
+        )
+        print("=" * 60)
+        return report
+
     astronauts = get_astronauts()
 
     # Use dynamic task mapping to run the print_astronaut_craft task for each
@@ -357,15 +764,31 @@ def example_astronauts():
         person_in_space=astronauts  # Define dependencies using TaskFlow API syntax
     )
 
-    summarise_spacecraft(astronauts)
+    spacecraft_summary = summarise_spacecraft(astronauts)
 
     weather = get_weather_data()
 
     astronaut_stats = calculate_astronauts_stats(astronauts)
 
-    analyze_correlation(weather=weather, astronaut_stats=astronaut_stats)
+    correlation = analyze_correlation(weather=weather, astronaut_stats=astronaut_stats)
 
-    get_iss_location()
+    generate_summary_report(
+        people_in_space=astronauts,
+        weather=weather,
+        correlation=correlation,
+        astronaut_stats=astronaut_stats,
+    )
+
+    iss_location = get_iss_location()
+
+    validate_data_quality(
+        people_in_space=astronauts,
+        weather=weather,
+        iss_location=iss_location,
+        spacecraft_summary=spacecraft_summary,
+        astronaut_stats=astronaut_stats,
+        correlation=correlation,
+    )
 
 
 # Instantiate the DAG
