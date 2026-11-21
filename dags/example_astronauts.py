@@ -24,13 +24,25 @@ from airflow import Dataset
 from airflow.decorators import dag, task
 from pendulum import datetime
 import requests
+import statistics
+
+# Coordinates of NASA Johnson Space Center, Houston, TX
+JSC_LATITUDE = 29.5593
+JSC_LONGITUDE = -95.0907
+
+# Nominal long-duration crew capacity per spacecraft, used for capacity
+# metrics. Crafts not listed here are reported without a capacity.
+SPACECRAFT_CAPACITY = {
+    "ISS": 7,
+    "Tiangong": 3,
+}
 
 # Datasets shared between the producer DAG and the consumer DAG in this file
 current_astronauts_dataset = Dataset("current_astronauts")
 iss_location_dataset = Dataset("iss_location")
-# A third dataset example: updates to this Dataset carry extra metadata
-# (a per-craft headcount) that downstream DAGs can read.
-astronaut_craft_summary_dataset = Dataset("astronaut_craft_summary")
+# A third dataset example: updated by `summarise_spacecraft`, its events carry
+# extra metadata (a per-spacecraft headcount) that downstream DAGs can read.
+spacecraft_summary_dataset = Dataset("spacecraft_summary")
 
 
 # Define the basic parameters of the DAG, like schedule and start_date
@@ -103,103 +115,171 @@ def example_astronauts():
         return location
 
     @task(
-        # A third dataset example: this task updates the
-        # `astronaut_craft_summary` Dataset and attaches extra metadata to it
-        outlets=[astronaut_craft_summary_dataset]
+        # Define that this task updates the `spacecraft_summary` Dataset, so
+        # downstream DAGs scheduled on it run after each aggregation.
+        outlets=[spacecraft_summary_dataset]
     )
-    def summarize_crafts(people_in_space: list[dict], **context) -> dict:
+    def summarise_spacecraft(people_in_space: list[dict], **context) -> dict:
         """
-        This task counts how many astronauts are aboard each craft. Through
-        `outlet_events`, it attaches the counts as `extra` metadata on the
-        Dataset event, so downstream DAGs can read the summary straight from
-        the event without pulling XComs from this DAG.
+        This task aggregates the astronaut data by spacecraft, counting the
+        number of astronauts on each spacecraft. The output is saved as the
+        `spacecraft_summary` Dataset, which can trigger downstream tasks in
+        other DAGs. The counts are also attached to the Dataset event as
+        `extra` metadata and returned via XCom.
         """
-        craft_counts: dict[str, int] = {}
-        for person in people_in_space:
-            craft_counts[person["craft"]] = craft_counts.get(person["craft"], 0) + 1
-
-        context["outlet_events"][astronaut_craft_summary_dataset].extra = {
-            "craft_counts": craft_counts,
-            "total_people": len(people_in_space),
-        }
-        print(f"Astronauts per craft: {craft_counts}")
-        return craft_counts
-
-    @task
-    def aggregate_astronaut_data(people_in_space: list[dict]) -> dict:
-        """
-        This task processes the astronaut data and builds a set of summary
-        statistics: total count, spacecraft distribution, unique crafts, and
-        an analysis of astronaut names. It returns a dictionary with all of
-        the calculated statistics, which is pushed to XCom for downstream use.
-        """
-        total_count = len(people_in_space)
-
-        # Spacecraft distribution: headcount and share of total per craft
-        craft_counts: dict[str, int] = {}
+        spacecraft_counts: dict[str, int] = {}
         for person in people_in_space:
             craft = person.get("craft", "Unknown")
-            craft_counts[craft] = craft_counts.get(craft, 0) + 1
+            spacecraft_counts[craft] = spacecraft_counts.get(craft, 0) + 1
 
-        craft_distribution = {
-            craft: {
-                "count": count,
-                "percentage": round(count / total_count * 100, 2)
-                if total_count
-                else 0.0,
-            }
-            for craft, count in sorted(
-                craft_counts.items(), key=lambda item: item[1], reverse=True
-            )
+        summary = {
+            "spacecraft_counts": spacecraft_counts,
+            "total_astronauts": len(people_in_space),
+            "spacecraft_count": len(spacecraft_counts),
         }
-        unique_crafts = sorted(craft_counts)
 
-        # Name analysis
-        names = [person.get("name", "").strip() for person in people_in_space]
+        context["outlet_events"][spacecraft_summary_dataset].extra = summary
+
+        for craft, count in sorted(
+            spacecraft_counts.items(), key=lambda item: item[1], reverse=True
+        ):
+            print(f"  - {craft}: {count} astronaut(s)")
+        return summary
+
+    @task
+    def aggregate_astronaut_data() -> dict:
+        """
+        This task fetches weather data from the Open-Meteo API (free, no API
+        key required). It uses the coordinates of Houston, TX (NASA Johnson
+        Space Center) to get relevant weather data, and returns weather
+        metrics that will be correlated with astronaut data.
+        """
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": JSC_LATITUDE,
+                "longitude": JSC_LONGITUDE,
+                "current": ",".join(
+                    [
+                        "temperature_2m",
+                        "relative_humidity_2m",
+                        "apparent_temperature",
+                        "precipitation",
+                        "cloud_cover",
+                        "surface_pressure",
+                        "wind_speed_10m",
+                        "wind_direction_10m",
+                        "weather_code",
+                    ]
+                ),
+                "timezone": "America/Chicago",
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        current = r.json()["current"]
+
+        weather = {
+            "location": "Houston, TX (NASA Johnson Space Center)",
+            "latitude": JSC_LATITUDE,
+            "longitude": JSC_LONGITUDE,
+            "observed_at": current.get("time"),
+            "temperature_c": current.get("temperature_2m"),
+            "apparent_temperature_c": current.get("apparent_temperature"),
+            "relative_humidity_pct": current.get("relative_humidity_2m"),
+            "precipitation_mm": current.get("precipitation"),
+            "cloud_cover_pct": current.get("cloud_cover"),
+            "surface_pressure_hpa": current.get("surface_pressure"),
+            "wind_speed_kmh": current.get("wind_speed_10m"),
+            "wind_direction_deg": current.get("wind_direction_10m"),
+            "weather_code": current.get("weather_code"),
+        }
+        print(
+            f"Weather at {weather['location']} ({weather['observed_at']}): "
+            f"{weather['temperature_c']}°C, "
+            f"{weather['relative_humidity_pct']}% humidity, "
+            f"wind {weather['wind_speed_kmh']} km/h, "
+            f"cloud cover {weather['cloud_cover_pct']}%"
+        )
+        return weather
+
+    @task
+    def calculate_astronauts_stats(people_in_space: list[dict]) -> dict:
+        """
+        This task performs advanced statistical calculations on astronaut
+        data, including name length analysis, spacecraft capacity metrics,
+        distribution patterns, and statistical measures (mean, median,
+        variance, etc.).
+        """
+
+        def describe(values: list[float]) -> dict:
+            """Mean, median, variance, standard deviation, min, max and range."""
+            if not values:
+                return {"count": 0}
+            return {
+                "count": len(values),
+                "mean": round(statistics.mean(values), 2),
+                "median": statistics.median(values),
+                "mode": statistics.mode(values),
+                "variance": round(statistics.pvariance(values), 2),
+                "std_dev": round(statistics.pstdev(values), 2),
+                "min": min(values),
+                "max": max(values),
+                "range": max(values) - min(values),
+            }
+
+        # Name length analysis
+        names = [p.get("name", "").strip() for p in people_in_space]
         names = [name for name in names if name]
         name_lengths = [len(name) for name in names]
+        name_length_stats = describe(name_lengths)
+        if names:
+            name_length_stats["longest_name"] = max(names, key=len)
+            name_length_stats["shortest_name"] = min(names, key=len)
 
-        first_initial_counts: dict[str, int] = {}
-        last_name_counts: dict[str, int] = {}
-        for name in names:
-            initial = name[0].upper()
-            first_initial_counts[initial] = first_initial_counts.get(initial, 0) + 1
-            last_name = name.split()[-1]
-            last_name_counts[last_name] = last_name_counts.get(last_name, 0) + 1
-
-        name_analysis = {
-            "total_names": len(names),
-            "unique_names": len(set(names)),
-            "average_name_length": round(sum(name_lengths) / len(names), 2)
-            if names
-            else 0.0,
-            "longest_name": max(names, key=len) if names else None,
-            "shortest_name": min(names, key=len) if names else None,
-            "names_sorted": sorted(names),
-            "first_initial_distribution": dict(sorted(first_initial_counts.items())),
-            "shared_last_names": {
-                last: count for last, count in last_name_counts.items() if count > 1
-            },
+        # Distribution patterns: astronauts per spacecraft
+        crew_counts: dict[str, int] = {}
+        for person in people_in_space:
+            craft = person.get("craft", "Unknown")
+            crew_counts[craft] = crew_counts.get(craft, 0) + 1
+        total = len(people_in_space)
+        distribution = {
+            craft: {
+                "count": count,
+                "share_pct": round(count / total * 100, 2) if total else 0.0,
+            }
+            for craft, count in sorted(
+                crew_counts.items(), key=lambda item: item[1], reverse=True
+            )
         }
+        crew_size_stats = describe(list(crew_counts.values()))
+
+        # Spacecraft capacity metrics, against nominal long-duration crew sizes
+        capacity_metrics = {}
+        for craft, count in crew_counts.items():
+            capacity = SPACECRAFT_CAPACITY.get(craft)
+            capacity_metrics[craft] = {
+                "crew": count,
+                "nominal_capacity": capacity,
+                "utilization_pct": round(count / capacity * 100, 2)
+                if capacity
+                else None,
+                "over_nominal_capacity": count > capacity if capacity else None,
+            }
 
         stats = {
-            "total_count": total_count,
-            "spacecraft_distribution": craft_distribution,
-            "unique_crafts": unique_crafts,
-            "unique_craft_count": len(unique_crafts),
-            "most_populated_craft": next(iter(craft_distribution), None),
-            "name_analysis": name_analysis,
+            "total_astronauts": total,
+            "name_length_stats": name_length_stats,
+            "crew_size_stats": crew_size_stats,
+            "distribution": distribution,
+            "capacity_metrics": capacity_metrics,
         }
 
-        print(f"Total astronauts in space: {total_count}")
-        print(f"Unique crafts ({len(unique_crafts)}): {', '.join(unique_crafts)}")
-        for craft, details in craft_distribution.items():
-            print(f"  - {craft}: {details['count']} ({details['percentage']}%)")
-        print(
-            f"Average name length: {name_analysis['average_name_length']}, "
-            f"longest: {name_analysis['longest_name']}, "
-            f"shortest: {name_analysis['shortest_name']}"
-        )
+        print(f"Total astronauts: {total}")
+        print(f"Name length stats: {name_length_stats}")
+        print(f"Crew size per spacecraft stats: {crew_size_stats}")
+        for craft, metrics in capacity_metrics.items():
+            print(f"  - {craft}: {metrics}")
         return stats
 
     astronauts = get_astronauts()
@@ -210,9 +290,11 @@ def example_astronauts():
         person_in_space=astronauts  # Define dependencies using TaskFlow API syntax
     )
 
-    summarize_crafts(astronauts)
+    summarise_spacecraft(astronauts)
 
-    aggregate_astronaut_data(astronauts)
+    aggregate_astronaut_data()
+
+    calculate_astronauts_stats(astronauts)
 
     get_iss_location()
 
@@ -255,8 +337,8 @@ example_iss_dataset_consumer()
 
 @dag(
     start_date=datetime(2024, 1, 1),
-    # Runs every time the `astronaut_craft_summary` Dataset is updated
-    schedule=[astronaut_craft_summary_dataset],
+    # Runs every time the `spacecraft_summary` Dataset is updated
+    schedule=[spacecraft_summary_dataset],
     catchup=False,
     default_args={"owner": "Astro", "retries": 3},
     tags=["example"],
@@ -269,13 +351,13 @@ def example_craft_summary_consumer():
         that triggered this run and prints the per-craft headcount.
         """
         triggering_events = context["triggering_dataset_events"]
-        for event in triggering_events[astronaut_craft_summary_dataset.uri]:
+        for event in triggering_events[spacecraft_summary_dataset.uri]:
             extra = event.extra or {}
             print(
-                f"{extra.get('total_people', 'Unknown')} people in space "
+                f"{extra.get('total_astronauts', 'Unknown')} people in space "
                 f"(reported by {event.source_dag_id} at {event.timestamp}):"
             )
-            for craft, count in extra.get("craft_counts", {}).items():
+            for craft, count in extra.get("spacecraft_counts", {}).items():
                 print(f"  - {craft}: {count}")
 
     report_craft_summary()
