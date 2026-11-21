@@ -147,7 +147,7 @@ def example_astronauts():
         return summary
 
     @task
-    def aggregate_astronaut_data() -> dict:
+    def get_weather_data() -> dict:
         """
         This task fetches weather data from the Open-Meteo API (free, no API
         key required). It uses the coordinates of Houston, TX (NASA Johnson
@@ -282,6 +282,73 @@ def example_astronauts():
             print(f"  - {craft}: {metrics}")
         return stats
 
+    @task
+    def analyze_correlation(weather: dict, astronaut_stats: dict) -> dict:
+        """
+        This task combines the Houston weather metrics with the astronaut
+        statistics into a single snapshot. It pairs each weather metric with
+        the astronaut metrics for this run and derives simple indicators,
+        such as whether conditions at Johnson Space Center are calm and clear.
+
+        A single run gives one data point per metric, so this is a snapshot
+        and not a statistical correlation. Collecting these snapshots across
+        runs gives the series needed for one.
+        """
+        total_astronauts = astronaut_stats.get("total_astronauts", 0)
+        name_stats = astronaut_stats.get("name_length_stats", {})
+        crew_stats = astronaut_stats.get("crew_size_stats", {})
+
+        temperature = weather.get("temperature_c")
+        wind_speed = weather.get("wind_speed_kmh")
+        cloud_cover = weather.get("cloud_cover_pct")
+        precipitation = weather.get("precipitation_mm")
+
+        # Calm and clear: light wind, no precipitation, mostly clear skies
+        calm_and_clear = (
+            wind_speed is not None
+            and cloud_cover is not None
+            and precipitation is not None
+            and wind_speed < 20
+            and precipitation == 0
+            and cloud_cover < 50
+        )
+
+        astronauts_per_degree = (
+            round(total_astronauts / temperature, 4) if temperature else None
+        )
+
+        analysis = {
+            "observed_at": weather.get("observed_at"),
+            "location": weather.get("location"),
+            "weather": {
+                "temperature_c": temperature,
+                "relative_humidity_pct": weather.get("relative_humidity_pct"),
+                "wind_speed_kmh": wind_speed,
+                "cloud_cover_pct": cloud_cover,
+                "precipitation_mm": precipitation,
+                "surface_pressure_hpa": weather.get("surface_pressure_hpa"),
+            },
+            "astronauts": {
+                "total_astronauts": total_astronauts,
+                "mean_name_length": name_stats.get("mean"),
+                "mean_crew_size": crew_stats.get("mean"),
+                "spacecraft_count": crew_stats.get("count", 0),
+            },
+            "indicators": {
+                "calm_and_clear_at_jsc": calm_and_clear,
+                "astronauts_per_degree_c": astronauts_per_degree,
+            },
+        }
+
+        print(
+            f"{total_astronauts} astronauts in space while Houston reports "
+            f"{temperature}°C, wind {wind_speed} km/h, "
+            f"cloud cover {cloud_cover}%."
+        )
+        print(f"Calm and clear at JSC: {calm_and_clear}")
+        print(f"Correlation snapshot: {analysis}")
+        return analysis
+
     astronauts = get_astronauts()
 
     # Use dynamic task mapping to run the print_astronaut_craft task for each
@@ -292,9 +359,11 @@ def example_astronauts():
 
     summarise_spacecraft(astronauts)
 
-    aggregate_astronaut_data()
+    weather = get_weather_data()
 
-    calculate_astronauts_stats(astronauts)
+    astronaut_stats = calculate_astronauts_stats(astronauts)
+
+    analyze_correlation(weather=weather, astronaut_stats=astronaut_stats)
 
     get_iss_location()
 
